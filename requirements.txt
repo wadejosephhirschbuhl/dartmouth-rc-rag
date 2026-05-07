@@ -7,4 +7,4 @@ html2text>=2024.2.26
 pypdf>=4.2
 python-docx>=1.1
 sentence-transformers>=2.7
-tqdm>=4.66
+rank-bm25>=0.2.2
