@@ -178,12 +178,13 @@ with st.sidebar:
     st.header("Workspace")
     collection_name = st.text_input("Collection name", value=DEFAULT_COLLECTION)
     st.header("Model")
-    forced = st.session_state.pop("__force_gentle_model__", None)
-    model = st.text_input("Ollama model", value=forced or DEFAULT_MODEL)
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+    forced_model = st.session_state.pop("__force_model__", None)
+    model = st.text_input("Ollama model", value=forced_model or DEFAULT_MODEL)
+    forced_temp = st.session_state.pop("__force_temperature__", None)
+    temperature = st.slider("Temperature", 0.0, 1.5, forced_temp if forced_temp is not None else 0.2, 0.1)
     st.header("Retrieval")
-    k = st.slider("Top-k chunks (final)", 1, 10, 4)
-    max_chars = st.slider("Max context chars", 2000, 20000, 12000, 1000)
+    k = st.slider("Top-k chunks (final)", 1, 20, 4)
+    max_chars = st.slider("Max context chars", 2000, 60000, 12000, 1000)
     use_reranker = st.checkbox("Use cross-encoder reranker (slower, often better)", value=False)
     candidate_k = k
     if use_reranker:
@@ -197,14 +198,27 @@ with st.sidebar:
             "num_gpu": -1,
             "num_ctx": 4096,
         }
-    if st.button("Gentle mode (safe defaults)"):
-        st.session_state["perf_defaults"] = {
-            "num_thread": max(1, cpu_count // 2),
-            "num_gpu": 0,
-            "num_ctx": 2048,
-        }
-        st.session_state["__force_gentle_model__"] = "llama3.2:3b"
-        st.rerun()
+    col_g, col_s = st.columns(2)
+    with col_g:
+        if st.button("Gentle mode", help="Safe, cool, quiet defaults"):
+            st.session_state["perf_defaults"] = {
+                "num_thread": max(1, cpu_count // 2),
+                "num_gpu": 0,
+                "num_ctx": 2048,
+            }
+            st.session_state["__force_model__"] = "llama3.2:3b"
+            st.session_state["__force_temperature__"] = 0.2
+            st.rerun()
+    with col_s:
+        if st.button("Smart mode", help="Tuned for gemma4:26b on a 24GB+ Mac"):
+            st.session_state["perf_defaults"] = {
+                "num_thread": cpu_count,
+                "num_gpu": -1,
+                "num_ctx": 16384,
+            }
+            st.session_state["__force_model__"] = "gemma4:26b"
+            st.session_state["__force_temperature__"] = 1.0
+            st.rerun()
     num_thread = st.slider(
         "Ollama CPU threads", 1, cpu_count,
         st.session_state["perf_defaults"]["num_thread"],
@@ -218,9 +232,9 @@ with st.sidebar:
     )
     num_ctx = st.select_slider(
         "Context window (num_ctx)",
-        options=[1024, 2048, 4096, 8192],
+        options=[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
         value=st.session_state["perf_defaults"]["num_ctx"],
-        help="Smaller = less RAM/compute. 2048 is plenty for most RAG queries.",
+        help="Smaller = less RAM/compute. 2048 is plenty for short Q&A; bump to 16384+ for big-context models like gemma4:26b (256K capable).",
     )
 
     st.header("Ingestion")

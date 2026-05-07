@@ -134,19 +134,33 @@ fit in VRAM.
 Smaller = far less RAM and compute. `2048` is plenty for most RAG queries;
 default is `4096`. Halving the context roughly halves memory pressure.
 
-### Gentle mode
+### Mode presets
 
-Click the **"Gentle mode (safe defaults)"** button to apply a cool-and-quiet
-preset:
+Two one-click presets in the Performance section:
+
+**Gentle mode** - cool-and-quiet for old laptops, on-battery use, or just
+keeping the fans off:
 
 - `num_thread` = half your cores
 - `num_gpu` = `0` (CPU only)
 - `num_ctx` = `2048`
-- Switches the model to `llama3.2:3b`
+- `temperature` = `0.2`
+- Model -> `llama3.2:3b`
 
-Pull that model first if you havent:
+**Smart mode** - tuned for `gemma4:26b` on a 24 GB+ Apple Silicon machine.
+Gemma 4 is a Mixture-of-Experts model (25.2B total / 3.8B active per token)
+with frontier-class reasoning and a 256K context window:
 
-    ollama pull llama3.2:3b
+- `num_thread` = all cores
+- `num_gpu` = `-1` (all on GPU)
+- `num_ctx` = `16384`
+- `temperature` = `1.0` (per Googles official spec for Gemma 4)
+- Model -> `gemma4:26b`
+
+Pull whichever model youre going to use first:
+
+    ollama pull llama3.2:3b      # for Gentle mode
+    ollama pull gemma4:26b       # for Smart mode (~18 GB download)
 
 ### Embedding device
 
