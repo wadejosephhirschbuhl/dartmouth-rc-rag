@@ -10,6 +10,7 @@ from pypdf import PdfReader
 import docx
 import ollama
 from sentence_transformers import CrossEncoder
+from rank_bm25 import BM25Okapi
 
 from hinode_ingest import ingest_hinode_site
 
@@ -127,7 +128,64 @@ def upsert_uploads(col, uploads, chunk_size: int, overlap: int) -> Dict[str, int
         per_file_counts[filename] = file_chunks
     if ids:
         col.upsert(ids=ids, documents=docs, metadatas=metas)
+    st.session_state["__bm25_version__"] = st.session_state.get("__bm25_version__", 0) + 1
     return per_file_counts
+
+def _tokenize(text: str) -> list:
+    return re.findall(r"\w+", text.lower())
+
+
+@st.cache_resource(show_spinner=False)
+def get_bm25_index(_col, collection_name: str, version: int):
+    """Build a BM25 index over all docs in a collection. Cached on (name, version)."""
+    data = _col.get(include=["documents", "metadatas"])
+    docs = data.get("documents") or []
+    metas = data.get("metadatas") or []
+    if not docs:
+        return None
+    tokenized = [_tokenize(d) for d in docs]
+    return {"bm25": BM25Okapi(tokenized), "docs": docs, "metas": metas}
+
+
+def hybrid_retrieve(col, collection_name, bm25_version, question, k, alpha):
+    """Blend vector + BM25. alpha=1.0 -> pure vector, 0.0 -> pure BM25."""
+    pool_k = max(k * 5, 20)
+    vres = col.query(query_texts=[question], n_results=pool_k,
+                     include=["documents", "metadatas", "distances"])
+    v_docs = vres["documents"][0]
+    v_metas = vres["metadatas"][0]
+    v_dists = vres["distances"][0]
+    v_scores = {d: max(0.0, 1.0 - dist) for d, dist in zip(v_docs, v_dists)}
+
+    bm25_idx = get_bm25_index(col, collection_name, bm25_version)
+    bm25_by_doc = {}
+    if bm25_idx is not None:
+        scores = bm25_idx["bm25"].get_scores(_tokenize(question))
+        if len(scores):
+            mx = float(max(scores)) or 1.0
+            bm25_by_doc = {d: float(s) / mx for d, s in zip(bm25_idx["docs"], scores)}
+
+    candidates = {}
+    for d, m, dist in zip(v_docs, v_metas, v_dists):
+        candidates[d] = {"text": d, "meta": m, "distance": dist,
+                         "v_score": v_scores.get(d, 0.0),
+                         "bm25_score": bm25_by_doc.get(d, 0.0)}
+    if alpha < 1.0 and bm25_idx is not None:
+        ranked = sorted(zip(bm25_idx["docs"], bm25_idx["metas"],
+                            [bm25_by_doc.get(d, 0.0) for d in bm25_idx["docs"]]),
+                        key=lambda x: x[2], reverse=True)[:pool_k]
+        for d, m, s in ranked:
+            if d not in candidates:
+                candidates[d] = {"text": d, "meta": m, "distance": 1.0,
+                                 "v_score": 0.0, "bm25_score": s}
+
+    out = []
+    for c in candidates.values():
+        score = alpha * c["v_score"] + (1.0 - alpha) * c["bm25_score"]
+        out.append({**c, "score": score, "distance": 1.0 - score})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out[:k]
+
 
 def retrieve(col, question: str, k: int):
     res = col.query(
@@ -178,14 +236,20 @@ with st.sidebar:
     st.header("Workspace")
     collection_name = st.text_input("Collection name", value=DEFAULT_COLLECTION)
     st.header("Model")
-    forced_model = st.session_state.pop("__force_model__", None)
-    model = st.text_input("Ollama model", value=forced_model or DEFAULT_MODEL)
-    forced_temp = st.session_state.pop("__force_temperature__", None)
-    temperature = st.slider("Temperature", 0.0, 1.5, forced_temp if forced_temp is not None else 0.2, 0.1)
+    if "model_key" not in st.session_state:
+        st.session_state["model_key"] = DEFAULT_MODEL
+    model = st.text_input("Ollama model", key="model_key")
+    if "temperature_key" not in st.session_state:
+        st.session_state["temperature_key"] = 0.2
+    temperature = st.slider("Temperature", 0.0, 1.5, step=0.1, key="temperature_key")
     st.header("Retrieval")
     k = st.slider("Top-k chunks (final)", 1, 20, 4)
     max_chars = st.slider("Max context chars", 2000, 60000, 12000, 1000)
     use_reranker = st.checkbox("Use cross-encoder reranker (slower, often better)", value=False)
+    alpha = st.slider("Hybrid retrieval (vector ↔ BM25)", 0.0, 1.0, 0.7, 0.05,
+                      help="1.0 = pure vector. 0.0 = pure BM25 keyword. Lower for keyword-heavy queries.")
+    memory_turns = st.slider("Conversation memory (turns)", 0, 8, 2, 1,
+                             help="How many prior user/assistant exchanges to include in the prompt.")
     candidate_k = k
     if use_reranker:
         candidate_k = st.slider("Candidate pool (retrieve N, rerank to k)", 6, 30, min(16, max(8, k * 4)))
@@ -198,27 +262,31 @@ with st.sidebar:
             "num_gpu": -1,
             "num_ctx": 4096,
         }
+    def _apply_gentle():
+        st.session_state["perf_defaults"] = {
+            "num_thread": max(1, cpu_count // 2),
+            "num_gpu": 0,
+            "num_ctx": 2048,
+        }
+        st.session_state["model_key"] = "llama3.2:3b"
+        st.session_state["temperature_key"] = 0.2
+
+    def _apply_smart():
+        st.session_state["perf_defaults"] = {
+            "num_thread": cpu_count,
+            "num_gpu": -1,
+            "num_ctx": 16384,
+        }
+        st.session_state["model_key"] = "gemma4:26b"
+        st.session_state["temperature_key"] = 1.0
+
     col_g, col_s = st.columns(2)
     with col_g:
-        if st.button("Gentle mode", help="Safe, cool, quiet defaults"):
-            st.session_state["perf_defaults"] = {
-                "num_thread": max(1, cpu_count // 2),
-                "num_gpu": 0,
-                "num_ctx": 2048,
-            }
-            st.session_state["__force_model__"] = "llama3.2:3b"
-            st.session_state["__force_temperature__"] = 0.2
-            st.rerun()
+        st.button("Gentle mode", on_click=_apply_gentle,
+                  help="Safe, cool, quiet defaults")
     with col_s:
-        if st.button("Smart mode", help="Tuned for gemma4:26b on a 24GB+ Mac"):
-            st.session_state["perf_defaults"] = {
-                "num_thread": cpu_count,
-                "num_gpu": -1,
-                "num_ctx": 16384,
-            }
-            st.session_state["__force_model__"] = "gemma4:26b"
-            st.session_state["__force_temperature__"] = 1.0
-            st.rerun()
+        st.button("Smart mode", on_click=_apply_smart,
+                  help="Tuned for gemma4:26b on a 24GB+ Mac")
     num_thread = st.slider(
         "Ollama CPU threads", 1, cpu_count,
         st.session_state["perf_defaults"]["num_thread"],
@@ -290,6 +358,7 @@ if st.button("Ingest site"):
             on_progress=on_progress,
         )
     st.success(f"Site ingest complete via **{stats['mode']}**.")
+    st.session_state["__bm25_version__"] = st.session_state.get("__bm25_version__", 0) + 1
     st.json(stats)
     st.caption(f"Indexed chunks now: {collection_count(col)}")
 
@@ -313,7 +382,9 @@ if question:
                 answer = "No documents indexed yet. Upload files or ingest a site first."
                 hits = []
             else:
-                pool = retrieve(col, question, k=(candidate_k if use_reranker else k))
+                bm25_version = st.session_state.get("__bm25_version__", 0)
+                pool = hybrid_retrieve(col, collection_name, bm25_version,
+                                       question, k=(candidate_k if use_reranker else k), alpha=alpha)
                 if use_reranker and pool:
                     try:
                         reranker = get_reranker()
@@ -338,27 +409,38 @@ INSTRUCTIONS:
 - Cite sources EXACTLY as [filename p#], e.g. [BeeBasicsBook.pdf p21] or [rc.dartmouth.edu/hpc/ p1].
 - Do NOT cite numbers like [1]. Do NOT invent citations.
 """
-                    resp = ollama.chat(
-                        model=model,
-                        messages=[
-                            {"role":"system","content":SYSTEM_PROMPT},
-                            {"role":"user","content":user_prompt}
-                        ],
-                        options={
-                            "temperature": temperature,
-                            "num_thread": num_thread,
-                            "num_gpu": num_gpu,
-                            "num_ctx": num_ctx,
-                        },
-                    )
-                    answer = resp["message"]["content"]
-        st.markdown(answer)
+                    history_msgs = []
+                    if memory_turns > 0:
+                        prior = st.session_state["messages"][:-1]
+                        history_msgs = prior[-(2 * memory_turns):]
+                    messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    messages_payload.extend(history_msgs)
+                    messages_payload.append({"role": "user", "content": user_prompt})
+
+                    def token_stream():
+                        for chunk in ollama.chat(
+                            model=model,
+                            messages=messages_payload,
+                            stream=True,
+                            options={
+                                "temperature": temperature,
+                                "num_thread": num_thread,
+                                "num_gpu": num_gpu,
+                                "num_ctx": num_ctx,
+                            },
+                        ):
+                            tok = chunk.get("message", {}).get("content", "")
+                            if tok:
+                                yield tok
+
+                    answer = st.write_stream(token_stream)
         with st.expander("Retrieved context (debug)"):
             for h in hits:
                 src = h["meta"].get("source", "unknown")
                 page = h["meta"].get("page", "?")
                 url = h["meta"].get("url", "")
-                extra = f", rerank={h['rerank_score']:.4f}" if "rerank_score" in h else ""
+                hybrid_part = f", hybrid={h['score']:.3f}" if "score" in h else ""
+                extra = (f", rerank={h['rerank_score']:.4f}" if "rerank_score" in h else "") + hybrid_part
                 header = f"**{src} p{page}** (distance={h['distance']:.4f}{extra})"
                 if url:
                     header += f" — [{url}]({url})"
