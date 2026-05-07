@@ -98,6 +98,76 @@ Fixes (try in order):
 Avoid Python 3.14 on Tahoe for now - the same expat issue affects it and
 not all of our deps have stable 3.14 wheels yet.
 
+## Performance / Dont melt your machine
+
+The sidebar has a **Performance** section that exposes Ollamas main
+throttling knobs. All three are passed straight through to `ollama.chat()`
+so changes take effect on the next question.
+
+### CPU threads (`num_thread`)
+
+Caps how many CPU threads Ollama uses. Defaults to half your cores. Lower =
+cooler and quieter, slightly slower.
+
+### GPU layers (`num_gpu`)
+
+LLMs are made of stacked transformer layers (llama3.1:8b has 32, llama3.2:3b
+has 28). `num_gpu` controls how many of those layers run on the GPU, counted
+from the top:
+
+| Value | What happens                              | Speed       | Heat       |
+|-------|-------------------------------------------|-------------|------------|
+| `-1`  | All layers on GPU (max offload)           | Fastest     | Hottest    |
+| `0`   | All layers on CPU (no GPU used at all)    | Slowest     | Coolest    |
+| `8`   | First 8 layers on GPU, rest on CPU        | Medium      | Medium     |
+| `16`  | First 16 layers on GPU                    | Faster      | Hotter     |
+| `24+` | Most/all on GPU                           | Near `-1`   | Near `-1`  |
+
+`-1` is "use them all" - works for any model regardless of layer count.
+On Apple Silicon, GPU and CPU share unified memory, so `-1` is almost
+always the right choice unless youre actively trying to throttle.
+On NVIDIA, use a partial value (e.g. `16`) only if the full model wont
+fit in VRAM.
+
+### Context window (`num_ctx`)
+
+Smaller = far less RAM and compute. `2048` is plenty for most RAG queries;
+default is `4096`. Halving the context roughly halves memory pressure.
+
+### Gentle mode
+
+Click the **"Gentle mode (safe defaults)"** button to apply a cool-and-quiet
+preset:
+
+- `num_thread` = half your cores
+- `num_gpu` = `0` (CPU only)
+- `num_ctx` = `2048`
+- Switches the model to `llama3.2:3b`
+
+Pull that model first if you havent:
+
+    ollama pull llama3.2:3b
+
+### Embedding device
+
+The sentence-transformers embedding model runs on CPU by default. Override
+with the `RAG_EMBED_DEVICE` env var (`mps` for Apple GPU, `cuda` for NVIDIA):
+
+    RAG_EMBED_DEVICE=mps streamlit run app.py
+
+### Other heat-reducing options
+
+- **Smaller model**: `llama3.2:3b` or `llama3.2:1b` instead of `llama3.1:8b`.
+- **Leave the cross-encoder reranker off** unless you need it.
+- **macOS Low Power Mode** (System Settings -> Battery) caps GPU clock globally.
+- Run Ollama under `cpulimit` or `taskpolicy -c utility` for hard system caps:
+
+        brew install cpulimit
+        brew services stop ollama
+        cpulimit -l 200 -- ollama serve         # max ~2 cores total
+        # or
+        taskpolicy -c utility ollama serve      # prefer efficiency cores
+
 ## Configuration
 
 Sidebar controls:

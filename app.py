@@ -87,7 +87,7 @@ def load_bytes_as_pages(filename: str, data: bytes) -> List[Tuple[str, Dict]]:
 @st.cache_resource
 def get_client_and_embed():
     client = chromadb.PersistentClient(path=str(DB_DIR))
-    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL, device=os.environ.get("RAG_EMBED_DEVICE", "cpu"))
     return client, embed_fn
 
 @st.cache_resource
@@ -178,7 +178,8 @@ with st.sidebar:
     st.header("Workspace")
     collection_name = st.text_input("Collection name", value=DEFAULT_COLLECTION)
     st.header("Model")
-    model = st.text_input("Ollama model", value=DEFAULT_MODEL)
+    forced = st.session_state.pop("__force_gentle_model__", None)
+    model = st.text_input("Ollama model", value=forced or DEFAULT_MODEL)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
     st.header("Retrieval")
     k = st.slider("Top-k chunks (final)", 1, 10, 4)
@@ -188,6 +189,40 @@ with st.sidebar:
     if use_reranker:
         candidate_k = st.slider("Candidate pool (retrieve N, rerank to k)", 6, 30, min(16, max(8, k * 4)))
         st.caption(f"Reranker: {RERANK_MODEL}")
+    st.header("Performance (don't melt your machine)")
+    cpu_count = os.cpu_count() or 8
+    if "perf_defaults" not in st.session_state:
+        st.session_state["perf_defaults"] = {
+            "num_thread": max(1, cpu_count // 2),
+            "num_gpu": -1,
+            "num_ctx": 4096,
+        }
+    if st.button("Gentle mode (safe defaults)"):
+        st.session_state["perf_defaults"] = {
+            "num_thread": max(1, cpu_count // 2),
+            "num_gpu": 0,
+            "num_ctx": 2048,
+        }
+        st.session_state["__force_gentle_model__"] = "llama3.2:3b"
+        st.rerun()
+    num_thread = st.slider(
+        "Ollama CPU threads", 1, cpu_count,
+        st.session_state["perf_defaults"]["num_thread"],
+        help="Lower = cooler, slower. Half your cores is a safe default.",
+    )
+    num_gpu = st.selectbox(
+        "GPU layers (num_gpu)",
+        [-1, 0, 8, 16, 24, 32],
+        index=[-1, 0, 8, 16, 24, 32].index(st.session_state["perf_defaults"]["num_gpu"]),
+        help="-1 = all GPU (fastest, hottest). 0 = CPU only (coolest, slowest). Integer = partial offload.",
+    )
+    num_ctx = st.select_slider(
+        "Context window (num_ctx)",
+        options=[1024, 2048, 4096, 8192],
+        value=st.session_state["perf_defaults"]["num_ctx"],
+        help="Smaller = less RAM/compute. 2048 is plenty for most RAG queries.",
+    )
+
     st.header("Ingestion")
     chunk_size = st.slider("Chunk size (chars)", 400, 2500, 1200, 100)
     overlap = st.slider("Overlap (chars)", 0, 600, 200, 50)
@@ -295,7 +330,12 @@ INSTRUCTIONS:
                             {"role":"system","content":SYSTEM_PROMPT},
                             {"role":"user","content":user_prompt}
                         ],
-                        options={"temperature": temperature},
+                        options={
+                            "temperature": temperature,
+                            "num_thread": num_thread,
+                            "num_gpu": num_gpu,
+                            "num_ctx": num_ctx,
+                        },
                     )
                     answer = resp["message"]["content"]
         st.markdown(answer)
