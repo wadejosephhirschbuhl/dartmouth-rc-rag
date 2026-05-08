@@ -6,7 +6,7 @@
 
 A fully local Retrieval-Augmented Generation chat app over:
 
-- Your own files (PDF / TXT / MD / DOCX), and
+- Your own files (PDF / TXT / MD / DOCX / CSV), and
 - Any **Hinode** site, with first-class support for the
   [mod-llm](https://github.com/gethinode/mod-llm) convention. Defaults to
   [rc.dartmouth.edu](https://rc.dartmouth.edu).

@@ -1,4 +1,4 @@
-import os, re, hashlib
+import os, re, hashlib, csv as _csv
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Tuple, List
@@ -52,7 +52,7 @@ DEFAULT_COLLECTION = "rc_website"
 OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.1:8b")
 RERANK_MODEL = os.environ.get("RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}
+SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx", ".csv"}
 SYSTEM_PROMPT = """You are a helpful assistant for research computing.
 Rules:
 1) Use ONLY the provided context to answer.
@@ -113,6 +113,35 @@ def load_bytes_as_pages(filename: str, data: bytes) -> List[Tuple[str, Dict]]:
         d = docx.Document(BytesIO(data))
         txt = clean_text("\n".join(p.text for p in d.paragraphs))
         return [(txt, {"source": filename, "page": 1})] if txt else []
+    if ext == ".csv":
+        # Parse CSV, render as markdown table chunks with headers repeated.
+        text = data.decode("utf-8", errors="ignore")
+        reader = _csv.reader(text.splitlines())
+        rows = [r for r in reader if any(c.strip() for c in r)]
+        if not rows:
+            return []
+        header, body = rows[0], rows[1:]
+        if not body:
+            # Header-only CSV; just emit the header line as one chunk
+            md = "| " + " | ".join(header) + " |\n"
+            md += "| " + " | ".join(["---"] * len(header)) + " |\n"
+            return [(md.strip(), {"source": filename, "page": 1})]
+        # Build markdown table with all rows; we'll chunk it page-style by
+        # repeating the header on each chunk so retrieved chunks remain meaningful.
+        rows_per_page = 40   # ~40 data rows per "page" - tunable
+        out = []
+        for page_num, start in enumerate(range(0, len(body), rows_per_page), start=1):
+            chunk_rows = body[start:start + rows_per_page]
+            md = "| " + " | ".join(header) + " |\n"
+            md += "| " + " | ".join(["---"] * len(header)) + " |\n"
+            for row in chunk_rows:
+                # Pad short rows, trim long ones to header width
+                padded = (row + [""] * len(header))[:len(header)]
+                # Escape pipe characters inside cells
+                cells = [c.replace("|", "\\|").replace("\n", " ").strip() for c in padded]
+                md += "| " + " | ".join(cells) + " |\n"
+            out.append((md.strip(), {"source": filename, "page": page_num}))
+        return out
     raise ValueError(f"Unhandled extension: {ext}")
 
 @st.cache_resource
@@ -457,10 +486,10 @@ with st.sidebar:
 
         # ----- Files sub-section -----
         st.markdown("##### 📄 Files")
-        st.caption("PDF · TXT · MD · DOCX")
+        st.caption("PDF · TXT · MD · DOCX · CSV")
         _uploads = st.file_uploader(
             "Drop files here",
-            type=["pdf", "txt", "md", "docx"],
+            type=["pdf", "txt", "md", "docx", "csv"],
             accept_multiple_files=True,
             key="sidebar_uploads",
             label_visibility="collapsed",
