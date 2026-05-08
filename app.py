@@ -590,6 +590,23 @@ st.subheader("Chat")
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
+def _short_pill_label(meta: dict) -> str:
+    """Return a short, human-friendly label for a citation pill."""
+    title = (meta.get("title") or "").strip()
+    if title:
+        return title[:30] + ("…" if len(title) > 30 else "")
+    src_path = meta.get("source", "")
+    if "/" in src_path:
+        seg = [s for s in src_path.split("/") if s]
+        if seg:
+            last = seg[-1]
+            last = last.replace("-", " ").replace("_", " ")
+            if len(last) > 30:
+                last = last[:30] + "…"
+            return last or src_path[:30]
+    return src_path[:30] + ("…" if len(src_path) > 30 else "")
+
+
 def _render_source_popovers(hits):
     if not hits:
         return
@@ -606,9 +623,7 @@ def _render_source_popovers(hits):
             _hpage = _h["meta"].get("page", "?")
             _hurl = _h["meta"].get("url", "")
             _htitle = _h["meta"].get("title", "") or _hsrc
-            _pill_label = f"{_hsrc} p{_hpage}"
-            if len(_pill_label) > 38:
-                _pill_label = _pill_label[:35] + "…"
+            _pill_label = f"{_short_pill_label(_h['meta'])} · p{_hpage}"
             with _cols[_i]:
                 with st.popover(_pill_label, use_container_width=True):
                     if _htitle and _htitle != _hsrc:
@@ -754,10 +769,7 @@ INSTRUCTIONS:
                     _hpage = _h["meta"].get("page", "?")
                     _hurl = _h["meta"].get("url", "")
                     _htitle = _h["meta"].get("title", "") or _hsrc
-                    # Compact pill label e.g. "rc.dartmouth.edu/hpc/ p1"
-                    _pill_label = f"{_hsrc} p{_hpage}"
-                    if len(_pill_label) > 38:
-                        _pill_label = _pill_label[:35] + "…"
+                    _pill_label = f"{_short_pill_label(_h['meta'])} · p{_hpage}"
                     with _cols[_i]:
                         with st.popover(_pill_label, use_container_width=True):
                             if _htitle and _htitle != _hsrc:
