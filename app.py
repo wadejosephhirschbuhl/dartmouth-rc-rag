@@ -274,9 +274,12 @@ if "chunk_size_key" not in st.session_state:
 if "overlap_key" not in st.session_state:
     st.session_state["overlap_key"] = 200
 
-def _set_mode(name): st.session_state["active_mode"] = name
+def _set_mode(name):
+    st.session_state["active_mode"] = name
 
 def _toggle_collection(name):
+    if "selected_collections" not in st.session_state:
+        st.session_state["selected_collections"] = set()
     sel = st.session_state["selected_collections"]
     if name in sel:
         sel.discard(name)
