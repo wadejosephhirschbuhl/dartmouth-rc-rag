@@ -1,4 +1,8 @@
-# Dartmouth RC RAG (Local - Ollama + Chroma + Hinode mod-llm aware)
+# Mira ✨
+
+*Local research assistant — chat with your files and Hinode sites, with citations.*
+
+*Originally built around [rc.dartmouth.edu](https://rc.dartmouth.edu) and the Hinode [mod-llm](https://github.com/gethinode/mod-llm) convention.*
 
 A fully local Retrieval-Augmented Generation chat app over:
 

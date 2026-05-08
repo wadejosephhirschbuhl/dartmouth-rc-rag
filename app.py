@@ -13,8 +13,38 @@ from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 
 from hinode_ingest import ingest_hinode_site
+import ingest_meta
 
-st.set_page_config(page_title="Local RAG (Ollama + Chroma + Hinode)", layout="wide")
+st.set_page_config(page_title="Mira", page_icon="✨", layout="wide")
+
+# Tag delete-button rows so CSS can target them reliably across Streamlit versions.
+st.markdown("""
+<style>
+/* Compact ✕ delete buttons inside any row that contains a .rag-del-marker */
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.rag-del-marker)
+  div:nth-child(3) button {
+    min-height: 1.5rem !important;
+    height: 1.5rem !important;
+    width: 1.8rem !important;
+    padding: 0 !important;
+    font-size: 0.85rem !important;
+    line-height: 1 !important;
+    background: transparent !important;
+    border: 1px solid rgba(255,255,255,0.15) !important;
+    color: rgba(255,255,255,0.55) !important;
+    border-radius: 4px !important;
+    box-shadow: none !important;
+}
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.rag-del-marker)
+  div:nth-child(3) button:hover {
+    border-color: rgba(255,90,90,0.75) !important;
+    color: rgba(255,140,140,1) !important;
+    background: rgba(255,90,90,0.08) !important;
+}
+/* Hide the marker span itself */
+.rag-del-marker { display: none; }
+</style>
+""", unsafe_allow_html=True)
 DB_DIR = Path("rag_chroma_db")
 DB_DIR.mkdir(exist_ok=True)
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -223,8 +253,8 @@ def ollama_up() -> bool:
     except Exception:
         return False
 
-st.title("Local RAG: Files + Hinode Sites -> Chat with Citations")
-st.caption("Ollama + Chroma + sentence-transformers, with mod-llm aware site ingestion")
+st.title("✨ Mira")
+st.caption("Local research assistant · chat with your files and any website, with citations.")
 
 if not ollama_up():
     st.error("Ollama is not reachable at http://127.0.0.1:11434. Start it with: `ollama serve` or `brew services start ollama`.")
@@ -232,29 +262,43 @@ if not ollama_up():
 
 client, embed_fn = get_client_and_embed()
 
+# ---------- session-state init ----------
+if "active_mode" not in st.session_state:
+    st.session_state["active_mode"] = "Custom"
+if "selected_collections" not in st.session_state:
+    st.session_state["selected_collections"] = set()
+if "ingest_target_key" not in st.session_state:
+    st.session_state["ingest_target_key"] = DEFAULT_COLLECTION
+
+def _set_mode(name): st.session_state["active_mode"] = name
+
+def _toggle_collection(name):
+    sel = st.session_state["selected_collections"]
+    if name in sel:
+        sel.discard(name)
+    else:
+        sel.add(name)
+
+# Snapshot existing collections (used by sidebar + chat block)
+try:
+    _existing = sorted([c.name for c in client.list_collections()])
+except Exception:
+    _existing = []
+
 with st.sidebar:
-    st.header("Workspace")
-    collection_name = st.text_input("Collection name", value=DEFAULT_COLLECTION)
-    st.header("Model")
-    if "model_key" not in st.session_state:
-        st.session_state["model_key"] = DEFAULT_MODEL
-    model = st.text_input("Ollama model", key="model_key")
-    if "temperature_key" not in st.session_state:
-        st.session_state["temperature_key"] = 0.2
-    temperature = st.slider("Temperature", 0.0, 1.5, step=0.1, key="temperature_key")
-    st.header("Retrieval")
-    k = st.slider("Top-k chunks (final)", 1, 20, 4)
-    max_chars = st.slider("Max context chars", 2000, 60000, 12000, 1000)
-    use_reranker = st.checkbox("Use cross-encoder reranker (slower, often better)", value=False)
-    alpha = st.slider("Hybrid retrieval (vector ↔ BM25)", 0.0, 1.0, 0.7, 0.05,
-                      help="1.0 = pure vector. 0.0 = pure BM25 keyword. Lower for keyword-heavy queries.")
-    memory_turns = st.slider("Conversation memory (turns)", 0, 8, 2, 1,
-                             help="How many prior user/assistant exchanges to include in the prompt.")
-    candidate_k = k
-    if use_reranker:
-        candidate_k = st.slider("Candidate pool (retrieve N, rerank to k)", 6, 30, min(16, max(8, k * 4)))
-        st.caption(f"Reranker: {RERANK_MODEL}")
-    st.header("Performance (don't melt your machine)")
+    # ----- Mode badge -----
+    _mode = st.session_state.get("active_mode", "Custom")
+    _badge_map = {
+        "Gentle": "🌱 Gentle",
+        "Balanced": "⚖️ Balanced",
+        "Smart": "🚀 Smart",
+        "Thinker": "🧠 Thinker",
+        "Custom": "⚙️ Custom",
+    }
+    _badge = _badge_map.get(_mode, "⚙️ Custom")
+    st.markdown(f"**Mode:** {_badge}")
+
+    # ----- Mode preset (its own panel) -----
     cpu_count = os.cpu_count() or 8
     if "perf_defaults" not in st.session_state:
         st.session_state["perf_defaults"] = {
@@ -262,7 +306,9 @@ with st.sidebar:
             "num_gpu": -1,
             "num_ctx": 4096,
         }
+
     def _apply_gentle():
+        st.session_state["active_mode"] = "Gentle"
         st.session_state["perf_defaults"] = {
             "num_thread": max(1, cpu_count // 2),
             "num_gpu": 0,
@@ -271,7 +317,18 @@ with st.sidebar:
         st.session_state["model_key"] = "llama3.2:3b"
         st.session_state["temperature_key"] = 0.2
 
+    def _apply_balanced():
+        st.session_state["active_mode"] = "Balanced"
+        st.session_state["perf_defaults"] = {
+            "num_thread": max(1, cpu_count // 2),
+            "num_gpu": -1,
+            "num_ctx": 4096,
+        }
+        st.session_state["model_key"] = "llama3.1:8b"
+        st.session_state["temperature_key"] = 0.2
+
     def _apply_smart():
+        st.session_state["active_mode"] = "Smart"
         st.session_state["perf_defaults"] = {
             "num_thread": cpu_count,
             "num_gpu": -1,
@@ -280,126 +337,297 @@ with st.sidebar:
         st.session_state["model_key"] = "gemma4:26b"
         st.session_state["temperature_key"] = 1.0
 
-    col_g, col_s = st.columns(2)
-    with col_g:
-        st.button("Gentle mode", on_click=_apply_gentle,
-                  help="Safe, cool, quiet defaults")
-    with col_s:
-        st.button("Smart mode", on_click=_apply_smart,
-                  help="Tuned for gemma4:26b on a 24GB+ Mac")
-    num_thread = st.slider(
-        "Ollama CPU threads", 1, cpu_count,
-        st.session_state["perf_defaults"]["num_thread"],
-        help="Lower = cooler, slower. Half your cores is a safe default.",
-    )
-    num_gpu = st.selectbox(
-        "GPU layers (num_gpu)",
-        [-1, 0, 8, 16, 24, 32],
-        index=[-1, 0, 8, 16, 24, 32].index(st.session_state["perf_defaults"]["num_gpu"]),
-        help="-1 = all GPU (fastest, hottest). 0 = CPU only (coolest, slowest). Integer = partial offload.",
-    )
-    num_ctx = st.select_slider(
-        "Context window (num_ctx)",
-        options=[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
-        value=st.session_state["perf_defaults"]["num_ctx"],
-        help="Smaller = less RAM/compute. 2048 is plenty for short Q&A; bump to 16384+ for big-context models like gemma4:26b (256K capable).",
-    )
+    def _apply_thinker():
+        st.session_state["active_mode"] = "Thinker"
+        st.session_state["perf_defaults"] = {
+            "num_thread": cpu_count,
+            "num_gpu": -1,
+            "num_ctx": 8192,
+        }
+        st.session_state["model_key"] = "gpt-oss:20b"
+        st.session_state["temperature_key"] = 0.4
 
-    st.header("Ingestion")
-    chunk_size = st.slider("Chunk size (chars)", 400, 2500, 1200, 100)
-    overlap = st.slider("Overlap (chars)", 0, 600, 200, 50)
-    st.header("Danger zone")
-    confirm_reset = st.checkbox("I understand: reset deletes this collection")
-    if st.button("Reset collection") and confirm_reset:
-        try:
-            client.delete_collection(collection_name)
-        except Exception:
-            pass
-        st.success(f"Reset collection: {collection_name}")
+    with st.expander("⚡ Mode preset", expanded=True):
+        st.caption("Pick a preset, or leave it Custom and tune sliders below.")
+        row1_a, row1_b = st.columns(2, gap="small")
+        with row1_a:
+            st.button("Gentle", use_container_width=True, on_click=_apply_gentle,
+                      help="llama3.2:3b · CPU only · 2K ctx · cool & quiet")
+        with row1_b:
+            st.button("Balanced", use_container_width=True, on_click=_apply_balanced,
+                      help="llama3.1:8b · all GPU · 4K ctx · default sweet spot")
+        row2_a, row2_b = st.columns(2, gap="small")
+        with row2_a:
+            st.button("Smart", use_container_width=True, on_click=_apply_smart,
+                      help="gemma4:26b · all GPU · 16K ctx · 24 GB+ Mac")
+        with row2_b:
+            st.button("Thinker", use_container_width=True, on_click=_apply_thinker,
+                      help="gpt-oss:20b · all GPU · 8K ctx · slower but reasons more")
 
-col = get_collection(client, embed_fn, collection_name)
-st.caption(f"Indexed chunks in **{collection_name}**: {collection_count(col)}")
+    # ----- Collections (always-on panel) -----
+    with st.expander("📚 Collections", expanded=True):
+        if _existing:
+            st.caption("Tick to include in chat retrieval. ✕ to delete.")
+            for _ec_name in _existing:
+                _ec_obj = client.get_or_create_collection(name=_ec_name, embedding_function=embed_fn)
+                try:
+                    _ec_count = _ec_obj.count()
+                except Exception:
+                    _ec_count = 0
+                _meta = ingest_meta.get_meta(_ec_name) or {}
+                _ago = ingest_meta.humanize_ago(_meta.get("ts", 0))
+                _via = f" via {_meta.get('mode')}" if _meta.get("mode") else ""
+                _checked = _ec_name in st.session_state["selected_collections"]
+                _cb_col, _txt_col, _del_col = st.columns([0.6, 5, 0.8],
+                                                         vertical_alignment="center",
+                                                         gap="small")
+                with _cb_col:
+                    st.checkbox(_ec_name, value=_checked, key=f"sel_{_ec_name}",
+                                on_change=_toggle_collection, args=(_ec_name,),
+                                label_visibility="collapsed")
+                with _txt_col:
+                    st.markdown(
+                        f"<div style='line-height:1.2;'>"
+                        f"<strong>{_ec_name}</strong><br>"
+                        f"<span style='font-size:0.78em;opacity:0.7;'>"
+                        f"{_ec_count:,} chunks · {_ago}{_via}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+                with _del_col:
+                    st.markdown('<span class="rag-del-marker"></span>',
+                                unsafe_allow_html=True)
+                    if st.button("✕", key=f"del_{_ec_name}",
+                                 help=f"Delete collection {_ec_name}",
+                                 use_container_width=True):
+                        try:
+                            client.delete_collection(_ec_name)
+                            ingest_meta.forget(_ec_name)
+                            st.session_state["selected_collections"].discard(_ec_name)
+                            st.success(f"Deleted {_ec_name}")
+                            st.rerun()
+                        except Exception as _e:
+                            st.error(f"Couldn't delete {_ec_name}: {_e}")
+            _selected_count = len(st.session_state["selected_collections"])
+            if _selected_count == 0:
+                st.info("No collections selected → **Pure LLM mode** (no retrieval, no citations).")
+            else:
+                st.caption(f"✅ {_selected_count} collection(s) selected for retrieval.")
+        else:
+            st.caption("No collections yet. Use the sections below to ingest one.")
 
-st.subheader("1) Upload documents (runtime ingestion)")
-uploads = st.file_uploader(
-    "Drop PDF/TXT/MD/DOCX files here",
-    type=["pdf", "txt", "md", "docx"],
-    accept_multiple_files=True
-)
-if uploads and st.button("Ingest / Update Vector DB"):
-    with st.spinner("Chunking + embedding + upserting..."):
-        stats = upsert_uploads(col, uploads, chunk_size=chunk_size, overlap=overlap)
-    st.success("Ingest complete.")
-    st.write(stats)
-    st.caption(f"Indexed chunks now: {collection_count(col)}")
+    # ----- Model -----
+    with st.expander("Model", expanded=True):
+        if "model_key" not in st.session_state:
+            st.session_state["model_key"] = DEFAULT_MODEL
+        model = st.text_input("Ollama model", key="model_key")
+        if "temperature_key" not in st.session_state:
+            st.session_state["temperature_key"] = 0.2
+        temperature = st.slider("Temperature", 0.0, 1.5, step=0.1, key="temperature_key")
 
-st.subheader("2) Ingest a Hinode site (mod-llm aware)")
-st.caption(
-    "Tries `/llms.txt` first (clean markdown via mod-llm), falls back to `/sitemap.xml`, "
-    "then to a same-host crawl. Defaults to Dartmouth Research Computing."
-)
-site_url = st.text_input("Site URL", value="https://rc.dartmouth.edu")
-max_pages = st.slider("Max pages", 10, 500, 250, 10)
-if st.button("Ingest site"):
-    log = st.empty()
-    progress = st.progress(0.0)
-    def on_progress(done, total, msg):
-        if total > 0:
-            progress.progress(min(done / total, 1.0))
-        log.info(msg)
-    with st.spinner("Discovering and fetching pages..."):
-        stats = ingest_hinode_site(
-            col=col,
-            site_url=site_url,
-            max_pages=max_pages,
-            chunk_size=chunk_size,
-            overlap=overlap,
-            chunk_text_fn=chunk_text,
-            on_progress=on_progress,
+    # ----- Retrieval -----
+    with st.expander("Retrieval", expanded=False):
+        k = st.slider("Top-k chunks (final)", 1, 20, 4)
+        max_chars = st.slider("Max context chars", 2000, 60000, 12000, 1000)
+        use_reranker = st.checkbox("Use cross-encoder reranker (slower, often better)", value=False)
+        alpha = st.slider("Hybrid retrieval (vector ↔ BM25)", 0.0, 1.0, 0.7, 0.05,
+                          help="1.0 = pure vector. 0.0 = pure BM25 keyword. Lower for keyword-heavy queries.")
+        memory_turns = st.slider("Conversation memory (turns)", 0, 8, 2, 1,
+                                 help="How many prior user/assistant exchanges to include in the prompt.")
+        candidate_k = k
+        if use_reranker:
+            candidate_k = st.slider("Candidate pool (retrieve N, rerank to k)", 6, 30, min(16, max(8, k * 4)))
+            st.caption(f"Reranker: {RERANK_MODEL}")
+
+    # ----- Ingest (files + Hinode sites) -----
+    with st.expander("📥 Ingest", expanded=False):
+        st.text_input(
+            "Ingest into collection",
+            key="ingest_target_key",
+            help="Type a new collection name to create it, or an existing one to add to it.",
         )
-    st.success(f"Site ingest complete via **{stats['mode']}**.")
-    st.session_state["__bm25_version__"] = st.session_state.get("__bm25_version__", 0) + 1
-    st.json(stats)
-    st.caption(f"Indexed chunks now: {collection_count(col)}")
+        st.caption("Newly-ingested collections are auto-selected for retrieval.")
+        st.divider()
 
-st.divider()
+        # ----- Files sub-section -----
+        st.markdown("##### 📄 Files")
+        st.caption("PDF · TXT · MD · DOCX")
+        _uploads = st.file_uploader(
+            "Drop files here",
+            type=["pdf", "txt", "md", "docx"],
+            accept_multiple_files=True,
+            key="sidebar_uploads",
+            label_visibility="collapsed",
+        )
+        _ingest_files_clicked = st.button(
+            "Ingest files",
+            use_container_width=True,
+            disabled=not _uploads,
+            key="sidebar_ingest_files_btn",
+            help="Upload one or more files first, then click to ingest.",
+        )
+        if _ingest_files_clicked and _uploads:
+            _target = st.session_state["ingest_target_key"]
+            _col = get_collection(client, embed_fn, _target)
+            with st.spinner("Chunking + embedding + upserting..."):
+                _stats = upsert_uploads(_col, _uploads, chunk_size=chunk_size, overlap=overlap)
+            _total_added = sum(_stats.values())
+            ingest_meta.record_ingest(_target, mode="upload",
+                                      pages=len(_stats), chunks_added=_total_added)
+            st.session_state["selected_collections"].add(_target)
+            st.success(f"Ingested {_total_added} chunks into '{_target}'.")
+            st.rerun()
 
-st.subheader("3) Chat")
+        st.divider()
+
+        # ----- Hinode site sub-section -----
+        st.markdown("##### 🌐 Website")
+        st.caption("Smarter on Hinode sites (mod-llm aware): tries `/llms.txt` → `/sitemap.xml` → crawl")
+        _site_url = st.text_input(
+            "Site URL",
+            value="https://rc.dartmouth.edu",
+            key="sidebar_site_url",
+        )
+        _max_pages = st.slider("Max pages", 10, 500, 250, 10, key="sidebar_max_pages")
+        if st.button(
+            "Ingest site",
+            use_container_width=True,
+            key="sidebar_ingest_site_btn",
+            disabled=not _site_url.strip(),
+        ):
+            _target = st.session_state["ingest_target_key"]
+            _col = get_collection(client, embed_fn, _target)
+            _log = st.empty()
+            _progress = st.progress(0.0)
+            def _on_progress(done, total, msg):
+                if total > 0:
+                    _progress.progress(min(done / total, 1.0))
+                _log.info(msg)
+            with st.spinner("Discovering and fetching pages..."):
+                _stats = ingest_hinode_site(
+                    col=_col,
+                    site_url=_site_url,
+                    max_pages=_max_pages,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    chunk_text_fn=chunk_text,
+                    on_progress=_on_progress,
+                )
+            st.session_state["__bm25_version__"] = st.session_state.get("__bm25_version__", 0) + 1
+            ingest_meta.record_ingest(_target, mode=_stats.get("mode", "site"),
+                                      pages=_stats.get("fetched", 0), chunks_added=0)
+            st.session_state["selected_collections"].add(_target)
+            st.success(f"Site ingest complete via **{_stats['mode']}** into '{_target}'.")
+            st.json(_stats)
+            st.rerun()
+
+    # ----- Performance (sliders only) -----
+    with st.expander("Performance (don't melt your machine)", expanded=False):
+
+        num_thread = st.slider(
+            "Ollama CPU threads", 1, cpu_count,
+            st.session_state["perf_defaults"]["num_thread"],
+            help="Lower = cooler, slower. Half your cores is a safe default.",
+        )
+        num_gpu = st.selectbox(
+            "GPU layers (num_gpu)",
+            [-1, 0, 8, 16, 24, 32],
+            index=[-1, 0, 8, 16, 24, 32].index(st.session_state["perf_defaults"]["num_gpu"]),
+            help="-1 = all GPU (fastest, hottest). 0 = CPU only (coolest, slowest).",
+        )
+        num_ctx = st.select_slider(
+            "Context window (num_ctx)",
+            options=[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
+            value=st.session_state["perf_defaults"]["num_ctx"],
+            help="Smaller = less RAM/compute. 16384+ for big-context models like gemma4:26b.",
+        )
+
+    # ----- Ingestion knobs -----
+    with st.expander("Ingestion knobs", expanded=False):
+        chunk_size = st.slider("Chunk size (chars)", 400, 2500, 1200, 100)
+        overlap = st.slider("Overlap (chars)", 0, 600, 200, 50)
+
+st.subheader("Chat")
+
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-question = st.chat_input("Ask a question about your uploaded documents or the ingested site...")
+question = st.chat_input("Ask Mira about your documents or any ingested website...")
 if question:
     st.session_state["messages"].append({"role":"user","content":question})
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
         with st.spinner("Retrieving + generating..."):
-            if collection_count(col) == 0:
-                answer = "No documents indexed yet. Upload files or ingest a site first."
-                hits = []
-            else:
+            selected = sorted(st.session_state.get("selected_collections", set()))
+            hits = []
+            context = ""
+            pure_llm = (len(selected) == 0)
+
+            if not pure_llm:
+                # Multi-collection retrieval: query each, merge, sort by score
                 bm25_version = st.session_state.get("__bm25_version__", 0)
-                pool = hybrid_retrieve(col, collection_name, bm25_version,
-                                       question, k=(candidate_k if use_reranker else k), alpha=alpha)
-                if use_reranker and pool:
+                merged = []
+                pool_k = (candidate_k if use_reranker else k)
+                for _cn in selected:
+                    _c = get_collection(client, embed_fn, _cn)
+                    if collection_count(_c) == 0:
+                        continue
+                    merged.extend(hybrid_retrieve(_c, _cn, bm25_version,
+                                                  question, k=pool_k, alpha=alpha))
+                merged.sort(key=lambda h: h.get("score", 1.0 - h.get("distance", 1.0)),
+                            reverse=True)
+                if use_reranker and merged:
                     try:
                         reranker = get_reranker()
-                        hits = rerank_hits(question, pool, reranker)[:k]
+                        hits = rerank_hits(question, merged, reranker)[:k]
                     except Exception as e:
                         st.warning(f"Reranker failed ({e}). Falling back to vector ranking.")
-                        hits = pool[:k]
+                        hits = merged[:k]
                 else:
-                    hits = pool
+                    hits = merged[:k]
                 context = build_context(hits, max_chars=max_chars) if hits else ""
-                if not context:
-                    answer = "No relevant context retrieved. Try increasing k or rephrasing."
-                    hits = []
+
+            if pure_llm or not context:
+                # Pure-LLM mode: no retrieval (or no useful retrieval). Generic helpful-assistant prompt.
+                generic_system = (
+                    "You are a helpful, concise assistant. Answer the user's question to the best "
+                    "of your ability using your own knowledge. If you don't know, say so."
+                )
+                history_msgs = []
+                if memory_turns > 0:
+                    prior = st.session_state["messages"][:-1]
+                    history_msgs = prior[-(2 * memory_turns):]
+                messages_payload = [{"role": "system", "content": generic_system}]
+                messages_payload.extend(history_msgs)
+                messages_payload.append({"role": "user", "content": question})
+
+                def token_stream_pure():
+                    for chunk in ollama.chat(
+                        model=model,
+                        messages=messages_payload,
+                        stream=True,
+                        options={
+                            "temperature": temperature,
+                            "num_thread": num_thread,
+                            "num_gpu": num_gpu,
+                            "num_ctx": num_ctx,
+                        },
+                    ):
+                        tok = chunk.get("message", {}).get("content", "")
+                        if tok:
+                            yield tok
+
+                if pure_llm:
+                    st.caption("💬 Pure LLM mode · no retrieval, no citations")
                 else:
-                    user_prompt = f"""CONTEXT:
+                    st.caption("⚠️ No relevant context retrieved · answering without citations")
+                answer = st.write_stream(token_stream_pure)
+            else:
+                # RAG mode: at least one collection selected and we have retrieved context
+                user_prompt = f"""CONTEXT:
 {context}
 QUESTION:
 {question}
@@ -409,41 +637,42 @@ INSTRUCTIONS:
 - Cite sources EXACTLY as [filename p#], e.g. [BeeBasicsBook.pdf p21] or [rc.dartmouth.edu/hpc/ p1].
 - Do NOT cite numbers like [1]. Do NOT invent citations.
 """
-                    history_msgs = []
-                    if memory_turns > 0:
-                        prior = st.session_state["messages"][:-1]
-                        history_msgs = prior[-(2 * memory_turns):]
-                    messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}]
-                    messages_payload.extend(history_msgs)
-                    messages_payload.append({"role": "user", "content": user_prompt})
+                history_msgs = []
+                if memory_turns > 0:
+                    prior = st.session_state["messages"][:-1]
+                    history_msgs = prior[-(2 * memory_turns):]
+                messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages_payload.extend(history_msgs)
+                messages_payload.append({"role": "user", "content": user_prompt})
 
-                    def token_stream():
-                        for chunk in ollama.chat(
-                            model=model,
-                            messages=messages_payload,
-                            stream=True,
-                            options={
-                                "temperature": temperature,
-                                "num_thread": num_thread,
-                                "num_gpu": num_gpu,
-                                "num_ctx": num_ctx,
-                            },
-                        ):
-                            tok = chunk.get("message", {}).get("content", "")
-                            if tok:
-                                yield tok
+                def token_stream():
+                    for chunk in ollama.chat(
+                        model=model,
+                        messages=messages_payload,
+                        stream=True,
+                        options={
+                            "temperature": temperature,
+                            "num_thread": num_thread,
+                            "num_gpu": num_gpu,
+                            "num_ctx": num_ctx,
+                        },
+                    ):
+                        tok = chunk.get("message", {}).get("content", "")
+                        if tok:
+                            yield tok
 
-                    answer = st.write_stream(token_stream)
-        with st.expander("Retrieved context (debug)"):
-            for h in hits:
-                src = h["meta"].get("source", "unknown")
-                page = h["meta"].get("page", "?")
-                url = h["meta"].get("url", "")
-                hybrid_part = f", hybrid={h['score']:.3f}" if "score" in h else ""
-                extra = (f", rerank={h['rerank_score']:.4f}" if "rerank_score" in h else "") + hybrid_part
-                header = f"**{src} p{page}** (distance={h['distance']:.4f}{extra})"
-                if url:
-                    header += f" — [{url}]({url})"
-                st.markdown(header)
-                st.write(h["text"])
+                answer = st.write_stream(token_stream)
+        if hits:
+            with st.expander("Retrieved context (debug)"):
+                for h in hits:
+                    src = h["meta"].get("source", "unknown")
+                    page = h["meta"].get("page", "?")
+                    url = h["meta"].get("url", "")
+                    hybrid_part = f", hybrid={h['score']:.3f}" if "score" in h else ""
+                    extra = (f", rerank={h['rerank_score']:.4f}" if "rerank_score" in h else "") + hybrid_part
+                    header = f"**{src} p{page}** (distance={h['distance']:.4f}{extra})"
+                    if url:
+                        header += f" — [{url}]({url})"
+                    st.markdown(header)
+                    st.write(h["text"])
     st.session_state["messages"].append({"role":"assistant","content":answer})
