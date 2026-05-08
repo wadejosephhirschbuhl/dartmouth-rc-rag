@@ -269,6 +269,10 @@ if "selected_collections" not in st.session_state:
     st.session_state["selected_collections"] = set()
 if "ingest_target_key" not in st.session_state:
     st.session_state["ingest_target_key"] = DEFAULT_COLLECTION
+if "chunk_size_key" not in st.session_state:
+    st.session_state["chunk_size_key"] = 1200
+if "overlap_key" not in st.session_state:
+    st.session_state["overlap_key"] = 200
 
 def _set_mode(name): st.session_state["active_mode"] = name
 
@@ -468,8 +472,10 @@ with st.sidebar:
         if _ingest_files_clicked and _uploads:
             _target = st.session_state["ingest_target_key"]
             _col = get_collection(client, embed_fn, _target)
+            _cs = st.session_state.get("chunk_size_key", 1200)
+            _ov = st.session_state.get("overlap_key", 200)
             with st.spinner("Chunking + embedding + upserting..."):
-                _stats = upsert_uploads(_col, _uploads, chunk_size=chunk_size, overlap=overlap)
+                _stats = upsert_uploads(_col, _uploads, chunk_size=_cs, overlap=_ov)
             _total_added = sum(_stats.values())
             ingest_meta.record_ingest(_target, mode="upload",
                                       pages=len(_stats), chunks_added=_total_added)
@@ -502,13 +508,15 @@ with st.sidebar:
                 if total > 0:
                     _progress.progress(min(done / total, 1.0))
                 _log.info(msg)
+            _cs = st.session_state.get("chunk_size_key", 1200)
+            _ov = st.session_state.get("overlap_key", 200)
             with st.spinner("Discovering and fetching pages..."):
                 _stats = ingest_hinode_site(
                     col=_col,
                     site_url=_site_url,
                     max_pages=_max_pages,
-                    chunk_size=chunk_size,
-                    overlap=overlap,
+                    chunk_size=_cs,
+                    overlap=_ov,
                     chunk_text_fn=chunk_text,
                     on_progress=_on_progress,
                 )
@@ -543,16 +551,52 @@ with st.sidebar:
 
     # ----- Ingestion knobs -----
     with st.expander("Ingestion knobs", expanded=False):
-        chunk_size = st.slider("Chunk size (chars)", 400, 2500, 1200, 100)
-        overlap = st.slider("Overlap (chars)", 0, 600, 200, 50)
+        st.slider("Chunk size (chars)", 400, 2500, step=100, key="chunk_size_key")
+        st.slider("Overlap (chars)", 0, 600, step=50, key="overlap_key")
 
 st.subheader("Chat")
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
+def _render_source_popovers(hits):
+    if not hits:
+        return
+    st.markdown(
+        "<div style='margin-top:0.5rem; opacity:0.75; font-size:0.85em;'>📎 Sources</div>",
+        unsafe_allow_html=True,
+    )
+    _per_row = 4
+    for _start in range(0, len(hits), _per_row):
+        _row_hits = hits[_start:_start + _per_row]
+        _cols = st.columns(_per_row)
+        for _i, _h in enumerate(_row_hits):
+            _hsrc = _h["meta"].get("source", "unknown")
+            _hpage = _h["meta"].get("page", "?")
+            _hurl = _h["meta"].get("url", "")
+            _htitle = _h["meta"].get("title", "") or _hsrc
+            _pill_label = f"{_hsrc} p{_hpage}"
+            if len(_pill_label) > 38:
+                _pill_label = _pill_label[:35] + "…"
+            with _cols[_i]:
+                with st.popover(_pill_label, use_container_width=True):
+                    if _htitle and _htitle != _hsrc:
+                        st.markdown(f"**{_htitle}**")
+                    st.caption(f"{_hsrc} · p{_hpage}")
+                    if _hurl:
+                        st.markdown(f"[Open source ↗]({_hurl})")
+                    _chunk_text = _h["text"]
+                    if len(_chunk_text) > 1500:
+                        st.markdown(_chunk_text[:1500] + "…")
+                        with st.expander("Show full chunk"):
+                            st.markdown(_chunk_text)
+                    else:
+                        st.markdown(_chunk_text)
+
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        if m["role"] == "assistant" and m.get("hits"):
+            _render_source_popovers(m["hits"])
 
 question = st.chat_input("Ask Mira about your documents or any ingested website...")
 if question:
@@ -663,16 +707,49 @@ INSTRUCTIONS:
 
                 answer = st.write_stream(token_stream)
         if hits:
-            with st.expander("Retrieved context (debug)"):
-                for h in hits:
-                    src = h["meta"].get("source", "unknown")
-                    page = h["meta"].get("page", "?")
-                    url = h["meta"].get("url", "")
-                    hybrid_part = f", hybrid={h['score']:.3f}" if "score" in h else ""
-                    extra = (f", rerank={h['rerank_score']:.4f}" if "rerank_score" in h else "") + hybrid_part
-                    header = f"**{src} p{page}** (distance={h['distance']:.4f}{extra})"
-                    if url:
-                        header += f" — [{url}]({url})"
-                    st.markdown(header)
-                    st.write(h["text"])
-    st.session_state["messages"].append({"role":"assistant","content":answer})
+            # ----- Inline source popovers (one per retrieved chunk) -----
+            st.markdown(
+                "<div style='margin-top:0.5rem; opacity:0.75; font-size:0.85em;'>📎 Sources</div>",
+                unsafe_allow_html=True,
+            )
+            # Lay out source pills in rows of 4 so they stay compact in the chat width.
+            _per_row = 4
+            for _start in range(0, len(hits), _per_row):
+                _row_hits = hits[_start:_start + _per_row]
+                _cols = st.columns(_per_row)
+                for _i, _h in enumerate(_row_hits):
+                    _hsrc = _h["meta"].get("source", "unknown")
+                    _hpage = _h["meta"].get("page", "?")
+                    _hurl = _h["meta"].get("url", "")
+                    _htitle = _h["meta"].get("title", "") or _hsrc
+                    # Compact pill label e.g. "rc.dartmouth.edu/hpc/ p1"
+                    _pill_label = f"{_hsrc} p{_hpage}"
+                    if len(_pill_label) > 38:
+                        _pill_label = _pill_label[:35] + "…"
+                    with _cols[_i]:
+                        with st.popover(_pill_label, use_container_width=True):
+                            if _htitle and _htitle != _hsrc:
+                                st.markdown(f"**{_htitle}**")
+                            st.caption(f"{_hsrc} · p{_hpage}")
+                            if _hurl:
+                                st.markdown(f"[Open source ↗]({_hurl})")
+                            _hyb = (f" · hybrid={_h['score']:.3f}" if "score" in _h else "")
+                            _rer = (f" · rerank={_h['rerank_score']:.3f}" if "rerank_score" in _h else "")
+                            st.caption(f"distance={_h['distance']:.3f}{_hyb}{_rer}")
+                            st.divider()
+                            # The actual chunk content - the whole point of the popover.
+                            _chunk_text = _h["text"]
+                            if len(_chunk_text) > 1500:
+                                st.markdown(_chunk_text[:1500] + "…")
+                                with st.expander("Show full chunk"):
+                                    st.markdown(_chunk_text)
+                            else:
+                                st.markdown(_chunk_text)
+    st.session_state["messages"].append({"role":"assistant","content":answer,
+                                         "hits": [
+                                             {"meta": h["meta"], "text": h["text"],
+                                              "distance": h.get("distance", 1.0),
+                                              "score": h.get("score"),
+                                              "rerank_score": h.get("rerank_score")}
+                                             for h in hits
+                                         ] if hits else []})
